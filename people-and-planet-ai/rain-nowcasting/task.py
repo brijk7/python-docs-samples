@@ -53,8 +53,7 @@ def get_args():
 def parse_tfrecord(example_proto, features_dict):
     """Parses a single tf.train.Example."""
 
-    d = tf.io.parse_single_example(example_proto, features_dict)
-    return d
+    return tf.io.parse_single_example(example_proto, features_dict)
 
 
 def create_features_dict():
@@ -77,6 +76,7 @@ def convert_pct_to_binary(probability):
 
 
 def split_inputs_and_labels(values: dict):
+    """Splits a TFRecord value dictionary into input and label tensors for the model."""
     '''
     inputs = []
     for t in ['T0','T1','T2']:
@@ -88,12 +88,15 @@ def split_inputs_and_labels(values: dict):
     inputs = tf.image.resize_with_crop_or_pad(inputs, GOES_PATCH_SIZE-1, GOES_PATCH_SIZE-1)
 
     labels = {}
+    # Limit precipitation values to a max of 20 mm/hr
     tlabel1 = tf.expand_dims(values.pop(LABEL1), -1)
-    # limit precipitation values to a max of 20 mm/hr
     tf.clip_by_value(tlabel1, 0, 20)
+
+    # Crop label arrays to even size
     tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
     tlabel2 = tf.expand_dims(convert_pct_to_binary(values.pop(LABEL2)), -1)
     tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
+
     labels[MODEL_LABEL1] = tlabel1
     labels[MODEL_LABEL2] = tlabel2
 
@@ -136,15 +139,16 @@ def create_model(training_dataset):
     layer0 = tf.keras.Input(shape=(GOES_PATCH_SIZE-1, GOES_PATCH_SIZE-1, len(BANDS)))
     layer1 = normalizer(layer0)
 
+    # layer2t = tf.keras.layers.TimeDistributed(layer2)
     layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layer1)
     layerMP1 = tf.keras.layers.MaxPooling2D(pool_size=2)(layerC1)
     layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerMP1)
+
+    # branch for LABEL1 output
     layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
     layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
-    #layerMP2 = tf.keras.layers.MaxPooling2D(pool_size=2)(layerC2)
-    #layerMP2 = tf.keras.layers.MaxPooling2D(pool_size=2)(layerC2)
-    #layerUP1 = tf.keras.layers.UpSampling2D(size=2)(layerC3)
-    # layer2t = tf.keras.layers.TimeDistributed(layer2)
+
+    # branch for LABEL2 output
     layerC3b = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
     layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2, activation='sigmoid')(layerC3b)
 
