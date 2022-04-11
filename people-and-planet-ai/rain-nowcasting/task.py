@@ -69,13 +69,6 @@ def create_features_dict():
     return features_dict
 
 
-def convert_pct_to_binary(probability):
-    """Maps a continuous probability percentage to a binary 0 or 1."""
-
-    t50 = tf.constant([50.0])
-    return tf.cast(tf.math.greater(probability, t50), tf.float32)
-
-
 def split_inputs_and_labels(values: dict):
     """Splits a TFRecord value dictionary into input and label tensors for the model."""
     inputs = []
@@ -86,11 +79,12 @@ def split_inputs_and_labels(values: dict):
 
     labels = {}
     tlabel1 = tf.expand_dims(values.pop(LABEL1), -1)
+    tlabel2 = tf.expand_dims(values.pop(LABEL2), -1)
 
     # Crop label arrays to even size
     tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
-    tlabel2 = tf.expand_dims(convert_pct_to_binary(values.pop(LABEL2)), -1)
-    tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
+    tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, 8, 8)
+    tlabel2 = tf.divide(tf.math.reduce_mean(tlabel2), tf.constant([100.0]))
 
     labels[MODEL_LABEL1] = tlabel1
     labels[MODEL_LABEL2] = tlabel2
@@ -141,6 +135,7 @@ def create_model(training_dataset):
     # this is in-lieu of a more complex LSTM architecture
     layerC1t = tf.keras.layers.TimeDistributed(layerC1)(layer1)
     layerMP1 = tf.keras.layers.MaxPooling3D(pool_size=2)(layerC1t)
+    # remove the convolved time dimension
     layerRS1 = tf.keras.layers.Reshape((int(GOES_PATCH_SIZE/2), int(GOES_PATCH_SIZE/2), 32))(layerMP1)
     layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerRS1)
 
@@ -150,7 +145,8 @@ def create_model(training_dataset):
 
     # branch for LABEL2 output
     layerC3b = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
-    layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2, activation='sigmoid')(layerC3b)
+    layerF3b = tf.keras.layers.Flatten()(layerC3b)
+    layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2)(layerF3b)
 
     model = tf.keras.Model(inputs=layer0, outputs=[layerO1,layerO2])
 
