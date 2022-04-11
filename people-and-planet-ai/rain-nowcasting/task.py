@@ -30,6 +30,7 @@ https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2
 import argparse
 import tensorflow as tf
 
+GOES_BANDS = [f'CMI_C{i:02d}' for i in range(1,17)]
 BANDS = [f'T{t}_CMI_C{i:02d}' for t in [0,1,2] for i in range(1,17)]
 LABEL1 = 'HQprecipitation'
 MODEL_LABEL1 = 'rainAmt'
@@ -77,20 +78,14 @@ def convert_pct_to_binary(probability):
 
 def split_inputs_and_labels(values: dict):
     """Splits a TFRecord value dictionary into input and label tensors for the model."""
-    '''
     inputs = []
     for t in ['T0','T1','T2']:
       inputs.append([values[f'{t}_CMI_C{b:02d}'] for b in range(1,17)])
     inputs = tf.convert_to_tensor(inputs)
-    inputs = tf.transpose(inputs, [2,3,0,1])
-    '''
-    inputs = tf.stack([values[b] for b in BANDS], axis=-1)
-    inputs = tf.image.resize_with_crop_or_pad(inputs, GOES_PATCH_SIZE-1, GOES_PATCH_SIZE-1)
+    inputs = tf.transpose(inputs, [0,2,3,1])
 
     labels = {}
-    # Limit precipitation values to a max of 20 mm/hr
     tlabel1 = tf.expand_dims(values.pop(LABEL1), -1)
-    tf.clip_by_value(tlabel1, 0, 20)
 
     # Crop label arrays to even size
     tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
@@ -136,13 +131,18 @@ def create_model(training_dataset):
     normalizer = tf.keras.layers.experimental.preprocessing.Normalization()
     normalizer.adapt(feature_ds)
 
-    layer0 = tf.keras.Input(shape=(GOES_PATCH_SIZE-1, GOES_PATCH_SIZE-1, len(BANDS)))
+    layer0 = tf.keras.Input(shape=(3, GOES_PATCH_SIZE, GOES_PATCH_SIZE, len(GOES_BANDS)))
     layer1 = normalizer(layer0)
 
-    # layer2t = tf.keras.layers.TimeDistributed(layer2)
-    layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layer1)
-    layerMP1 = tf.keras.layers.MaxPooling2D(pool_size=2)(layerC1)
-    layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerMP1)
+    # core layers
+    # an initial Conv2D layer for low level features
+    layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
+    # time-distributed layer forces Conv2D params to be fixed across the 3 time dimensions
+    # this is in-lieu of a more complex LSTM architecture
+    layerC1t = tf.keras.layers.TimeDistributed(layerC1)(layer1)
+    layerMP1 = tf.keras.layers.MaxPooling3D(pool_size=2)(layerC1t)
+    layerRS1 = tf.keras.layers.Reshape((int(GOES_PATCH_SIZE/2), int(GOES_PATCH_SIZE/2), 32))(layerMP1)
+    layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerRS1)
 
     # branch for LABEL1 output
     layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
