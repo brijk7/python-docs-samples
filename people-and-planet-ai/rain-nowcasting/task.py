@@ -36,10 +36,9 @@ LABEL1 = 'HQprecipitation'
 MODEL_LABEL1 = 'rainAmt'
 LABEL2 = 'probabilityLiquidPrecipitation'
 MODEL_LABEL2 = 'rainChance'
-BATCH_SIZE = 64
 GOES_PATCH_SIZE = 65
-GPM_PATCH_SIZE = 33
-CONFIG = 'p64_s11132'
+GPM_PATCH_SIZE = 65
+CONFIG = 'p64_s2000'
 
 
 def get_args():
@@ -81,8 +80,11 @@ def split_inputs_and_labels(values: dict):
     tlabel1 = tf.expand_dims(values.pop(LABEL1), -1)
     tlabel2 = tf.expand_dims(values.pop(LABEL2), -1)
 
-    # Crop label arrays to even size
+    # Crop label1 array to even size
     tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
+    # Clip precipitation range to 0-20, and normalize to 0-1.
+    #tlabel1 = tf.divide(tf.clip_by_value(tlabel1, 0, 20.0), tf.constant([20.0]))
+    # Take the mean probability of the central 8x8 square for label2
     tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, 8, 8)
     tlabel2 = tf.divide(tf.math.reduce_mean(tlabel2), tf.constant([100.0]))
 
@@ -104,7 +106,7 @@ def create_datasets(bucket):
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
         .map(split_inputs_and_labels)
         .shuffle(100)
-        .batch(BATCH_SIZE)
+        .batch(64)
     )
 
     validation_dataset = (
@@ -112,7 +114,7 @@ def create_datasets(bucket):
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
         .map(split_inputs_and_labels)
         .shuffle(100)
-        .batch(BATCH_SIZE)
+        .batch(64)
     )
 
     return training_dataset, validation_dataset
@@ -130,21 +132,22 @@ def create_model(training_dataset):
 
     # core layers
     # an initial Conv2D layer for low level features
-    layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
+    layerC1 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
     # time-distributed layer forces Conv2D params to be fixed across the 3 time dimensions
     # this is in-lieu of a more complex LSTM architecture
-    layerC1t = tf.keras.layers.TimeDistributed(layerC1)(layer1)
-    layerMP1 = tf.keras.layers.MaxPooling3D(pool_size=2)(layerC1t)
+    layerC1 = tf.keras.layers.TimeDistributed(layerC1)(layer1)
+    layerC1 = tf.keras.layers.MaxPooling3D(pool_size=2)(layerC1)
     # remove the convolved time dimension
-    layerRS1 = tf.keras.layers.Reshape((int(GOES_PATCH_SIZE/2), int(GOES_PATCH_SIZE/2), 32))(layerMP1)
-    layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerRS1)
+    layerC1 = tf.keras.layers.Reshape((int(GOES_PATCH_SIZE/2), int(GOES_PATCH_SIZE/2), 64))(layerC1)
+    layerC2 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
 
     # branch for LABEL1 output
-    layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
+    layerM1 = tf.keras.layers.UpSampling2D(2)(layerC2)
+    layerC3 = tf.keras.layers.Conv2D(filters=256, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerM1)
     layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
 
     # branch for LABEL2 output
-    layerC3b = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
+    layerC3b = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
     layerF3b = tf.keras.layers.Flatten()(layerC3b)
     layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2)(layerF3b)
 
