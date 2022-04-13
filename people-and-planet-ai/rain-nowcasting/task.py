@@ -38,7 +38,8 @@ LABEL2 = 'probabilityLiquidPrecipitation'
 MODEL_LABEL2 = 'rainChance'
 GOES_PATCH_SIZE = 65
 GPM_PATCH_SIZE = 65
-CONFIG = 'p64_s2000'
+CONFIG = 'p64_s11132'
+USE_CATEGORICAL_LABEL1 = False
 
 
 def get_args():
@@ -76,18 +77,22 @@ def split_inputs_and_labels(values: dict):
     inputs = tf.convert_to_tensor(inputs)
     inputs = tf.transpose(inputs, [0,2,3,1])
 
-    labels = {}
-    tlabel1 = tf.expand_dims(values.pop(LABEL1), -1)
-    tlabel2 = tf.expand_dims(values.pop(LABEL2), -1)
-
     # Crop label1 array to even size
-    tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
-    # Clip precipitation range to 0-20, and normalize to 0-1.
-    #tlabel1 = tf.divide(tf.clip_by_value(tlabel1, 0, 20.0), tf.constant([20.0]))
+    # Clip precipitation range to 0-20, and quantize to 2 mm/hr ranges.
+    tlabel1 = values.pop(LABEL1)
+    if USE_CATEGORICAL_LABEL1:
+      tlabel1 = tf.math.divide(tf.clip_by_value(tlabel1, 0, 20.0), tf.constant([2.0]))
+      tlabel1 = tf.one_hot(tf.cast(tlabel1, tf.uint8), 10)
+    else:
+      tlabel1 = tf.expand_dims(tlabel1, -1)
+    #tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
+
     # Take the mean probability of the central 8x8 square for label2
+    tlabel2 = tf.expand_dims(values.pop(LABEL2), -1)
     tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, 8, 8)
     tlabel2 = tf.divide(tf.math.reduce_mean(tlabel2), tf.constant([100.0]))
 
+    labels = {}
     labels[MODEL_LABEL1] = tlabel1
     labels[MODEL_LABEL2] = tlabel2
 
@@ -105,7 +110,7 @@ def create_datasets(bucket):
         tf.data.TFRecordDataset(train_data_file, compression_type="GZIP")
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
         .map(split_inputs_and_labels)
-        .shuffle(100)
+        .shuffle(10)
         .batch(64)
     )
 
@@ -113,7 +118,7 @@ def create_datasets(bucket):
         tf.data.TFRecordDataset(eval_data_file, compression_type="GZIP")
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
         .map(split_inputs_and_labels)
-        .shuffle(100)
+        .shuffle(10)
         .batch(64)
     )
 
@@ -132,22 +137,26 @@ def create_model(training_dataset):
 
     # core layers
     # an initial Conv2D layer for low level features
-    layerC1 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
+    layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
     # time-distributed layer forces Conv2D params to be fixed across the 3 time dimensions
     # this is in-lieu of a more complex LSTM architecture
     layerC1 = tf.keras.layers.TimeDistributed(layerC1)(layer1)
-    layerC1 = tf.keras.layers.MaxPooling3D(pool_size=2)(layerC1)
-    # remove the convolved time dimension
-    layerC1 = tf.keras.layers.Reshape((int(GOES_PATCH_SIZE/2), int(GOES_PATCH_SIZE/2), 64))(layerC1)
-    layerC2 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
+    # remove the time dimension
+    layerC1 = tf.keras.layers.MaxPooling3D(pool_size=(3,1,1))(layerC1)
+    layerC1 = tf.keras.layers.Reshape((GOES_PATCH_SIZE, GOES_PATCH_SIZE, 32))(layerC1)
 
     # branch for LABEL1 output
-    layerM1 = tf.keras.layers.UpSampling2D(2)(layerC2)
-    layerC3 = tf.keras.layers.Conv2D(filters=256, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerM1)
-    layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
+    #layerM1 = tf.keras.layers.UpSampling2D(2)(layerC1)
+    layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
+    if USE_CATEGORICAL_LABEL1:
+      label1_loss_fn = 'categorical_crossentropy'
+      layerO1 = tf.keras.layers.Dense(units=10, activation='softmax', name=MODEL_LABEL1)(layerC3)
+    else:
+      label1_loss_fn = 'mean_squared_error'
+      layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
 
     # branch for LABEL2 output
-    layerC3b = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
+    layerC3b = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
     layerF3b = tf.keras.layers.Flatten()(layerC3b)
     layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2)(layerF3b)
 
@@ -155,7 +164,7 @@ def create_model(training_dataset):
 
     model.compile(
         optimizer='adam',
-        loss={MODEL_LABEL1: tf.keras.losses.LogCosh(), MODEL_LABEL2: 'mean_squared_error'},
+        loss={MODEL_LABEL1: label1_loss_fn, MODEL_LABEL2: 'mean_squared_error'},
         metrics=['accuracy', 'mean_squared_error'],
     )
     return model
