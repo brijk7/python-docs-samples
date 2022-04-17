@@ -34,8 +34,6 @@ GOES_BANDS = [f'CMI_C{i:02d}' for i in range(1,17)]
 BANDS = [f'T{t}_CMI_C{i:02d}' for t in [0,1,2] for i in range(1,17)]
 LABEL1 = 'HQprecipitation'
 MODEL_LABEL1 = 'rainAmt'
-LABEL2 = 'probabilityLiquidPrecipitation'
-MODEL_LABEL2 = 'rainChance'
 GOES_PATCH_SIZE = 65
 GPM_PATCH_SIZE = 65
 CONFIG = 'p64_s11132'
@@ -44,7 +42,6 @@ USE_CATEGORICAL_LABEL1 = False
 
 def get_args():
     """Parses args."""
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--bucket", required=True, type=str, help="GCS Bucket")
     args = parser.parse_args()
@@ -53,19 +50,16 @@ def get_args():
 
 def parse_tfrecord(example_proto, features_dict):
     """Parses a single tf.train.Example."""
-
     return tf.io.parse_single_example(example_proto, features_dict)
 
 
 def create_features_dict():
     """Creates dict of features."""
-
     features_dict = {
       band_name: tf.io.FixedLenFeature(shape=[GOES_PATCH_SIZE, GOES_PATCH_SIZE], dtype=tf.float32)
       for band_name in BANDS
     }
     features_dict[LABEL1] = tf.io.FixedLenFeature(shape=[GPM_PATCH_SIZE, GPM_PATCH_SIZE], dtype=tf.float32)
-    features_dict[LABEL2] = tf.io.FixedLenFeature(shape=[GPM_PATCH_SIZE, GPM_PATCH_SIZE], dtype=tf.float32)
     return features_dict
 
 
@@ -77,31 +71,19 @@ def split_inputs_and_labels(values: dict):
     inputs = tf.convert_to_tensor(inputs)
     inputs = tf.transpose(inputs, [0,2,3,1])
 
-    # Crop label1 array to even size
-    # Clip precipitation range to 0-20, and quantize to 2 mm/hr ranges.
     tlabel1 = values.pop(LABEL1)
     if USE_CATEGORICAL_LABEL1:
+      # Clip precipitation range to 0-20, and quantize to 2 mm/hr ranges.
       tlabel1 = tf.math.divide(tf.clip_by_value(tlabel1, 0, 20.0), tf.constant([2.0]))
       tlabel1 = tf.one_hot(tf.cast(tlabel1, tf.uint8), 10)
     else:
       tlabel1 = tf.expand_dims(tlabel1, -1)
     #tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
-
-    # Take the mean probability of the central 8x8 square for label2
-    tlabel2 = tf.expand_dims(values.pop(LABEL2), -1)
-    tlabel2 = tf.image.resize_with_crop_or_pad(tlabel2, 8, 8)
-    tlabel2 = tf.divide(tf.math.reduce_mean(tlabel2), tf.constant([100.0]))
-
-    labels = {}
-    labels[MODEL_LABEL1] = tlabel1
-    labels[MODEL_LABEL2] = tlabel2
-
-    return inputs, labels
+    return inputs, tlabel1
 
 
 def create_datasets(bucket):
     """Creates training and validation datasets."""
-
     train_data_file = f"gs://{bucket}/nowcasting/{CONFIG}/training.tfrecord.gz"
     eval_data_file = f"gs://{bucket}/nowcasting/{CONFIG}/validation.tfrecord.gz"
     features_dict = create_features_dict()
@@ -127,7 +109,6 @@ def create_datasets(bucket):
 
 def create_model(training_dataset):
     """Creates model."""
-
     feature_ds = training_dataset.map(lambda x, y: x)
     normalizer = tf.keras.layers.experimental.preprocessing.Normalization()
     normalizer.adapt(feature_ds)
@@ -135,36 +116,27 @@ def create_model(training_dataset):
     layer0 = tf.keras.Input(shape=(3, GOES_PATCH_SIZE, GOES_PATCH_SIZE, len(GOES_BANDS)))
     layer1 = normalizer(layer0)
 
-    # core layers
-    # an initial Conv2D layer for low level features
-    layerC1 = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
     # time-distributed layer forces Conv2D params to be fixed across the 3 time dimensions
     # this is in-lieu of a more complex LSTM architecture
-    layerC1 = tf.keras.layers.TimeDistributed(layerC1)(layer1)
-    # remove the time dimension
+    layerC1 = tf.keras.layers.TimeDistributed(
+                tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
+              )(layer1)
+    # pool the time dimension
     layerC1 = tf.keras.layers.MaxPooling3D(pool_size=(3,1,1))(layerC1)
     layerC1 = tf.keras.layers.Reshape((GOES_PATCH_SIZE, GOES_PATCH_SIZE, 32))(layerC1)
 
-    # branch for LABEL1 output
-    #layerM1 = tf.keras.layers.UpSampling2D(2)(layerC1)
-    layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
+    layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
+    layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
     if USE_CATEGORICAL_LABEL1:
-      label1_loss_fn = 'categorical_crossentropy'
       layerO1 = tf.keras.layers.Dense(units=10, activation='softmax', name=MODEL_LABEL1)(layerC3)
     else:
-      label1_loss_fn = 'mean_squared_error'
       layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
 
-    # branch for LABEL2 output
-    layerC3b = tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
-    layerF3b = tf.keras.layers.Flatten()(layerC3b)
-    layerO2 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL2)(layerF3b)
-
-    model = tf.keras.Model(inputs=layer0, outputs=[layerO1,layerO2])
+    model = tf.keras.Model(inputs=layer0, outputs=layerO1)
 
     model.compile(
         optimizer='adam',
-        loss={MODEL_LABEL1: label1_loss_fn, MODEL_LABEL2: 'mean_squared_error'},
+        loss='mean_squared_error',
         metrics=['accuracy', 'mean_squared_error'],
     )
     return model
