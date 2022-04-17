@@ -119,14 +119,30 @@ def create_model(training_dataset):
     # time-distributed layer forces Conv2D params to be fixed across the 3 time dimensions
     # this is in-lieu of a more complex LSTM architecture
     layerC1 = tf.keras.layers.TimeDistributed(
-                tf.keras.layers.Conv2D(filters=32, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')
-              )(layer1)
+                tf.keras.layers.Conv2D(filters=32,
+                                       kernel_size=(3,3),
+                                       kernel_initializer='he_normal',
+                                       strides=(1,1),
+                                       activation='relu',
+                                       padding='same'))(layer1)
     # pool the time dimension
     layerC1 = tf.keras.layers.MaxPooling3D(pool_size=(3,1,1))(layerC1)
     layerC1 = tf.keras.layers.Reshape((GOES_PATCH_SIZE, GOES_PATCH_SIZE, 32))(layerC1)
 
-    layerC2 = tf.keras.layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC1)
-    layerC3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(layerC2)
+    layerC2 = tf.keras.layers.Conv2D(filters=64,
+                                     kernel_size=(3,3),
+                                     kernel_initializer='he_normal',
+                                     strides=(1,1),
+                                     activation='relu',
+                                     padding='same')(layerC1)
+
+    layerC3 = tf.keras.layers.Conv2D(filters=128,
+                                     kernel_size=(3,3),
+                                     kernel_initializer='he_normal',
+                                     strides=(1,1),
+                                     activation='relu',
+                                     padding='same')(layerC2)
+
     if USE_CATEGORICAL_LABEL1:
       layerO1 = tf.keras.layers.Dense(units=10, activation='softmax', name=MODEL_LABEL1)(layerC3)
     else:
