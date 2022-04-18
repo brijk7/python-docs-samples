@@ -36,7 +36,6 @@ LABEL1 = 'HQprecipitation'
 MODEL_LABEL1 = 'rainAmt'
 GOES_PATCH_SIZE = 65
 GPM_PATCH_SIZE = 65
-CONFIG = 'p64_s11132'
 USE_CATEGORICAL_LABEL1 = False
 
 
@@ -84,8 +83,8 @@ def split_inputs_and_labels(values: dict):
 
 def create_datasets(bucket):
     """Creates training and validation datasets."""
-    train_data_file = f"gs://{bucket}/nowcasting/{CONFIG}/training.tfrecord.gz"
-    eval_data_file = f"gs://{bucket}/nowcasting/{CONFIG}/validation.tfrecord.gz"
+    train_data_file = f'gs://{bucket}/nowcasting/training.tfrecord.gz'
+    eval_data_file = f'gs://{bucket}/nowcasting/validation.tfrecord.gz'
     features_dict = create_features_dict()
 
     training_dataset = (
@@ -164,7 +163,7 @@ def main():
     model = create_model(training_dataset)
     print(model.summary())
     model.fit(training_dataset, validation_data=validation_dataset, epochs=10)
-    model.save(f"gs://{args.bucket}/nowcasting/{CONFIG}/model")
+    model.save(f'gs://{args.bucket}/nowcasting/model')
 
 
 if __name__ == "__main__":
