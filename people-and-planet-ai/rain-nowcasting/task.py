@@ -13,22 +13,19 @@
 # limitations under the License.
 
 
-"""This training script trains binary classifier on Sentinel-2 satellite images.
-The model is a fully convolutional neural network that predicts whether a power
-plant is turned on or off.
+"""This training script trains a DNN model to forecast precipitation (rainfall) amounts
+based on GOES-16 satellite imagery.
+Input: GOES-16 MCMIPF images (https://developers.google.com/earth-engine/datasets/catalog/NOAA_GOES_16_MCMIPF)
+Output/Labels: GPM precipitation values (https://developers.google.com/earth-engine/datasets/catalog/NASA_GPM_L3_IMERG_V06)
+Both the input and output are represented as 2D regions.
 
-A Sentinel-2 image consists of 13 bands. Each band contains the data for a
-specific range of the electromagnetic spectrum.
-
-A JPEG image consists of three channels: Red, Green, and Blue. For Sentinel-2
-images, these correspond to Band 4 (red), Band 3 (green), and Band 2 (blue).
-These bands contain the raw pixel data directly from the satellite sensors.
-For more information on the Sentinel-2 dataset:
-https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2
+Input data is read from a GCS bucket specified as a command line parameter.
+The script produces a Keras TF model, which is saved to the same GCS bucket.
 """
 
 import argparse
 import tensorflow as tf
+import numpy
 
 GOES_BANDS = [f'CMI_C{i:02d}' for i in range(1,17)]
 BANDS = [f'T{t}_CMI_C{i:02d}' for t in [0,1,2] for i in range(1,17)]
@@ -36,7 +33,7 @@ LABEL1 = 'HQprecipitation'
 MODEL_LABEL1 = 'rainAmt'
 GOES_PATCH_SIZE = 65
 GPM_PATCH_SIZE = 65
-USE_CATEGORICAL_LABEL1 = False
+USE_CATEGORICAL_LABEL1 = True
 
 
 def get_args():
@@ -63,7 +60,7 @@ def create_features_dict():
 
 
 def split_inputs_and_labels(values: dict):
-    """Splits a TFRecord value dictionary into input and label tensors for the model."""
+    """Splits a TFRecord value dictionary into input and label tensors."""
     inputs = []
     for t in ['T0','T1','T2']:
       inputs.append([values[f'{t}_CMI_C{b:02d}'] for b in range(1,17)])
@@ -72,12 +69,11 @@ def split_inputs_and_labels(values: dict):
 
     tlabel1 = values.pop(LABEL1)
     if USE_CATEGORICAL_LABEL1:
-      # Clip precipitation range to 0-20, and quantize to 2 mm/hr ranges.
-      tlabel1 = tf.math.divide(tf.clip_by_value(tlabel1, 0, 20.0), tf.constant([2.0]))
+      # Clip precipitation range to 0-10, and quantize to 1 mm/hr ranges.
+      tlabel1 = tf.math.divide(tf.clip_by_value(tlabel1, 0, 10.0), tf.constant([1.0]))
       tlabel1 = tf.one_hot(tf.cast(tlabel1, tf.uint8), 10)
     else:
       tlabel1 = tf.expand_dims(tlabel1, -1)
-    #tlabel1 = tf.image.resize_with_crop_or_pad(tlabel1, GPM_PATCH_SIZE-1, GPM_PATCH_SIZE-1)
     return inputs, tlabel1
 
 
@@ -87,21 +83,22 @@ def create_datasets(bucket):
     eval_data_file = f'gs://{bucket}/nowcasting/validation.tfrecord.gz'
     features_dict = create_features_dict()
 
-    training_dataset = (
-        tf.data.TFRecordDataset(train_data_file, compression_type="GZIP")
-        .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
-        .map(split_inputs_and_labels)
-        .shuffle(10)
-        .batch(64)
-    )
+    training_dataset = tf.data.TFRecordDataset(train_data_file, compression_type="GZIP")
+    validation_dataset = tf.data.TFRecordDataset(eval_data_file, compression_type="GZIP")
+    print('Training dataset size: ', sum(1 for _ in training_dataset))
+    print('Validation dataset size: ', sum(1 for _ in validation_dataset))
 
-    validation_dataset = (
-        tf.data.TFRecordDataset(eval_data_file, compression_type="GZIP")
+    training_dataset = (training_dataset
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
         .map(split_inputs_and_labels)
         .shuffle(10)
-        .batch(64)
-    )
+        .batch(64))
+
+    validation_dataset = (validation_dataset
+        .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
+        .map(split_inputs_and_labels)
+        .shuffle(10)
+        .batch(64))
 
     return training_dataset, validation_dataset
 
@@ -151,7 +148,8 @@ def create_model(training_dataset):
 
     model.compile(
         optimizer='adam',
-        loss='mean_squared_error',
+        #loss='mean_squared_error',
+        loss='categorical_crossentropy',
         metrics=['accuracy', 'mean_squared_error'],
     )
     return model
