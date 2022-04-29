@@ -29,17 +29,18 @@ import numpy
 
 GOES_BANDS = [f'CMI_C{i:02d}' for i in range(1,17)]
 BANDS = [f'T{t}_CMI_C{i:02d}' for t in [0,1,2] for i in range(1,17)]
-LABEL1 = 'HQprecipitation'
-MODEL_LABEL1 = 'rainAmt'
+LABEL = 'HQprecipitation'
+MODEL_LABEL = 'rainAmt'
 GOES_PATCH_SIZE = 65
 GPM_PATCH_SIZE = 65
-USE_CATEGORICAL_LABEL1 = True
+USE_CATEGORICAL_LABEL = False
 
 
 def get_args():
     """Parses args."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--bucket", required=True, type=str, help="GCS Bucket")
+    parser.add_argument("--stats", required=False, action='store_true', default=False, help="Compute stats")
     args = parser.parse_args()
     return args
 
@@ -55,7 +56,7 @@ def create_features_dict():
       band_name: tf.io.FixedLenFeature(shape=[GOES_PATCH_SIZE, GOES_PATCH_SIZE], dtype=tf.float32)
       for band_name in BANDS
     }
-    features_dict[LABEL1] = tf.io.FixedLenFeature(shape=[GPM_PATCH_SIZE, GPM_PATCH_SIZE], dtype=tf.float32)
+    features_dict[LABEL] = tf.io.FixedLenFeature(shape=[GPM_PATCH_SIZE, GPM_PATCH_SIZE], dtype=tf.float32)
     return features_dict
 
 
@@ -67,17 +68,30 @@ def split_inputs_and_labels(values: dict):
     inputs = tf.convert_to_tensor(inputs)
     inputs = tf.transpose(inputs, [0,2,3,1])
 
-    tlabel1 = values.pop(LABEL1)
-    if USE_CATEGORICAL_LABEL1:
-      # Clip precipitation range to 0-10, and quantize to 1 mm/hr ranges.
-      tlabel1 = tf.math.divide(tf.clip_by_value(tlabel1, 0, 10.0), tf.constant([1.0]))
-      tlabel1 = tf.one_hot(tf.cast(tlabel1, tf.uint8), 10)
+    tlabel = values.pop(LABEL)
+    tlabel = tf.clip_by_value(tlabel, 0, 10.0)
+    if USE_CATEGORICAL_LABEL:
+      tlabel = tf.one_hot(tf.cast(tlabel, tf.uint8), 10)
     else:
-      tlabel1 = tf.expand_dims(tlabel1, -1)
-    return inputs, tlabel1
+      tlabel = tf.math.divide(tlabel, tf.constant([10.0]))
+      tlabel = tf.expand_dims(tlabel, -1)
+
+    return inputs, tlabel
 
 
-def create_datasets(bucket):
+def compute_stats(dataset):
+    sumRain = []
+    for i,l in dataset:
+      if USE_CATEGORICAL_LABEL:
+        l = tf.math.divide(tf.math.argmax(l, axis=-1), tf.constant([10.0]))
+      l = tf.math.reduce_sum(tf.where(tf.math.greater(l, tf.constant([0.05])), 1, 0))
+      sumRain.append(l.numpy())
+    h = numpy.histogram(sumRain, bins=10, range=[0,4096])
+    print('Dataset size: ', len(sumRain))
+    print('Distribution of precipitation: ', h[0])
+
+
+def create_datasets(bucket, stats):
     """Creates training and validation datasets."""
     train_data_file = f'gs://{bucket}/nowcasting/training.tfrecord.gz'
     eval_data_file = f'gs://{bucket}/nowcasting/validation.tfrecord.gz'
@@ -85,22 +99,22 @@ def create_datasets(bucket):
 
     training_dataset = tf.data.TFRecordDataset(train_data_file, compression_type="GZIP")
     validation_dataset = tf.data.TFRecordDataset(eval_data_file, compression_type="GZIP")
-    print('Training dataset size: ', sum(1 for _ in training_dataset))
-    print('Validation dataset size: ', sum(1 for _ in validation_dataset))
 
     training_dataset = (training_dataset
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
-        .map(split_inputs_and_labels)
-        .shuffle(10)
-        .batch(64))
+        .map(split_inputs_and_labels))
 
     validation_dataset = (validation_dataset
         .map(lambda example_proto: parse_tfrecord(example_proto, features_dict))
-        .map(split_inputs_and_labels)
-        .shuffle(10)
-        .batch(64))
+        .map(split_inputs_and_labels))
 
-    return training_dataset, validation_dataset
+    if stats:
+      print('Stats for training dataset: >>>')
+      compute_stats(training_dataset)
+      print('Stats for validation dataset: >>>')
+      compute_stats(validation_dataset)
+
+    return training_dataset.shuffle(10).batch(64), validation_dataset.shuffle(10).batch(64)
 
 
 def create_model(training_dataset):
@@ -139,17 +153,18 @@ def create_model(training_dataset):
                                      activation='relu',
                                      padding='same')(layerC2)
 
-    if USE_CATEGORICAL_LABEL1:
-      layerO1 = tf.keras.layers.Dense(units=10, activation='softmax', name=MODEL_LABEL1)(layerC3)
+    if USE_CATEGORICAL_LABEL:
+      layerO1 = tf.keras.layers.Dense(units=10, activation='softmax', name=MODEL_LABEL)(layerC3)
+      loss_function = 'categorical_crossentropy'
     else:
-      layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL1)(layerC3)
+      layerO1 = tf.keras.layers.Dense(units=1, name=MODEL_LABEL)(layerC3)
+      loss_function = 'mean_squared_error'
 
     model = tf.keras.Model(inputs=layer0, outputs=layerO1)
 
     model.compile(
         optimizer='adam',
-        #loss='mean_squared_error',
-        loss='categorical_crossentropy',
+        loss=loss_function,
         metrics=['accuracy', 'mean_squared_error'],
     )
     return model
@@ -157,12 +172,11 @@ def create_model(training_dataset):
 
 def main():
     args = get_args()
-    training_dataset, validation_dataset = create_datasets(args.bucket)
+    training_dataset, validation_dataset = create_datasets(args.bucket, args.stats)
     model = create_model(training_dataset)
     print(model.summary())
     model.fit(training_dataset, validation_data=validation_dataset, epochs=10)
     model.save(f'gs://{args.bucket}/nowcasting/model')
-
 
 if __name__ == "__main__":
     main()
